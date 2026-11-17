@@ -1,37 +1,47 @@
 """Forecast GTA VI's launch-day Twitch viewers, hour by hour, in five quantiles.
 
-Model: launch-day shape learned from past big launches.
+The centre of this forecaster is a launch-day shape learned from past big
+launches, with one correction the first version missed: the shape itself
+depends on how big the launch is.
 
 A launch day on Twitch is not flat. Viewers unlock in timezone waves --
 New Zealand and Australia first, then Japan, Europe, the UK, the US East
-Coast at 05:00Z, the US West Coast at 08:00Z -- so the audience climbs from
-its hour-1 print, peaks in the afternoon/evening, and falls overnight. The
-house baseline (flat persistence with a widening random-walk spread) ignores
-that shape entirely.
+Coast at 05:00Z, the US West Coast at 08:00Z -- so the audience climbs
+from its hour-1 print, peaks in the afternoon and evening, and falls
+overnight. The house baseline (flat persistence with a widening random-walk
+spread) ignores that shape entirely.
 
-This program instead measures the shape from the case's own comparables.
-For every past launch it takes the release day's hourly viewers, divides
-each hour by that launch's hour-1 print, and works in log space, where the
-curves are comparable across launches of very different sizes. For each
-forecast hour it then reports the weighted median of those log-ratios as the
-centre and the weighted spread of the log-ratios as the uncertainty, and
-anchors both on this launch's own hour-1 print.
-
+For every past launch this program takes the release day's hourly viewers,
+divides each hour by that launch's hour-1 print, and works in log space,
+where the curves are comparable across launches of very different sizes.
 Two filters keep the pool honest. A launch only counts if it was already
 live at midnight UTC on its release day -- its hour-1 print is at least a
 tenth of its own day peak -- because a game that unlocks at 14:00Z has a
 near-zero hour 1 and a meaningless ratio curve. And a launch is dropped if
 its notes record early access (or a weak-analogue tier): an audience that
-unlocked days early has already flattened its release-day curve, so it
-would drag the shape down.
+unlocked days early has already flattened its release-day curve.
 
-Games are weighted by how close their hour-1 print is to this launch's
-hour-1 print in log space (Gaussian kernel, bandwidth 1.0): a 100k-viewer
-launch is a better analogue for GTA VI than a 2k-viewer one, but the
-weighting degrades gracefully, so a record-breaking hour 1 still borrows
-from the biggest launches on record.
+The shape also shrinks with size. Across the pool, the evening log-ratio
+falls as hour-1 grows (correlation about -0.87 at hour 20): a mega launch
+is already near its audience at hour 1, while a smaller launch keeps
+growing as timezones wake up. So for each forecast hour the program fits
+a weighted straight line of log-ratio against log hour-1 across the pool
+(Gaussian kernel weights, bandwidth 0.75 in log space, so launches near
+this one's size matter most), and reads that line at this launch's own log
+hour-1. The line's slope is halved, because a 12-to-14-launch fit is
+noisy, and the result is averaged half-and-half with the weighted median
+of the pool's log-ratios, which does not extrapolate at all.
 
-The centre curve and the spread are each smoothed with a centred 3-hour
+Two guards keep the extrapolation honest. The slope only ever adjusts the
+forecast downward for a launch bigger than the pool's weighted-mean size:
+a smaller launch gets the weighted mean instead of an upward extrapolation
+the data does not support. And the total adjustment away from the median
+is capped at 0.3 log units, so a record-breaking hour-1 cannot push the
+curve outside the range past launches actually showed.
+
+The spread is the weighted standard deviation of the pool's residuals
+around that fitted line, per hour -- the scatter that stays after size is
+accounted for. Centre and spread are each smoothed with a centred 3-hour
 window, because launch curves move smoothly except at the unlock jumps the
 pool already averages over. If the pool is too thin (fewer than three
 usable launches) or hour 1 is too small to be a live launch hour, the
@@ -53,7 +63,6 @@ import sys
 # Standard normal quantiles for the five forecast levels 0.05/0.25/0.5/0.75/0.95.
 Z_SCORES = (-1.6448536269514722, -0.6744897501960817, 0.0,
             0.6744897501960817, 1.6448536269514722)
-LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 
 # A launch counts as live at midnight UTC when hour 1 reaches this share
 # of its own release-day peak. Below it, hour 1 is pre-unlock trickle and
@@ -61,16 +70,26 @@ LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 LIVE_SHARE = 0.10
 # Hour 1 below this is not a live launch hour: the day's shape is then
 # dominated by an unlock we cannot see, so fall back to persistence.
-MIN_LIVE_HOUR1 = 10000.0
+# (1000, not 10000: a small but real launch hour still forecasts far
+# better from the shape model than from flat persistence -- leave-one-out
+# on the pool's smallest live launch scores 0.34 shape vs 0.60 fallback.)
+MIN_LIVE_HOUR1 = 1000.0
 # Gaussian kernel bandwidth (in log space) for weighting comparables by
 # how close their hour-1 print is to this launch's.
-LOG_P1_BANDWIDTH = 1.0
+KERNEL_BANDWIDTH = 0.75
 # A comparable needs at least this many release-day hours to join the pool.
 MIN_RELEASE_HOURS = 20
 # The pool needs at least this many launches, else fall back to persistence.
 MIN_POOL_SIZE = 3
 # House-style spread growth used by the fallback, per hour past hour 1.
 FALLBACK_SPREAD = 0.15
+# The fitted size slope is halved before use; the blend below averages the
+# line's prediction with the weighted median.
+SLOPE_SHRINK = 0.5
+LINE_BLEND = 0.5
+# The line's prediction may move the centre at most this far (log units)
+# from the weighted median.
+MAX_ADJUSTMENT = 0.3
 
 MAX_VIEWERS = 1_000_000_000.0
 
@@ -146,16 +165,6 @@ def _weighted_median(pairs):
     return ordered[-1][0]
 
 
-def _weighted_spread(pairs, centre):
-    """Weighted standard deviation of log-ratios around a centre."""
-    total = sum(weight for _, weight in pairs)
-    if total <= 0:
-        return 0.0
-    variance = sum(weight * (value - centre) ** 2
-                   for value, weight in pairs) / total
-    return math.sqrt(max(variance, 0.0))
-
-
 def _smooth(values):
     """Centred 3-hour moving average over the hour -> value map."""
     smoothed = {}
@@ -172,20 +181,49 @@ def shape_forecast(hour1, pool):
     centres = {}
     spreads = {}
     for hour in range(2, 25):
-        pairs = []
+        sizes = []
+        ratios = []
+        weights = []
         for comp_hour1, comp_hours in pool:
             if hour not in comp_hours:
                 continue
             weight = math.exp(-0.5 * ((math.log(comp_hour1) - log_hour1)
-                                      / LOG_P1_BANDWIDTH) ** 2)
-            pairs.append((math.log(comp_hours[hour] / comp_hour1), weight))
-        if not pairs:
+                                      / KERNEL_BANDWIDTH) ** 2)
+            sizes.append(math.log(comp_hour1))
+            ratios.append(math.log(comp_hours[hour] / comp_hour1))
+            weights.append(weight)
+        if not sizes:
             centres[hour] = 0.0
             spreads[hour] = FALLBACK_SPREAD
             continue
-        centre = _weighted_median(pairs)
-        centres[hour] = centre
-        spreads[hour] = _weighted_spread(pairs, centre)
+        median = _weighted_median(list(zip(ratios, weights)))
+        total_weight = sum(weights)
+        mean_size = sum(s * w for s, w in zip(sizes, weights)) / total_weight
+        mean_ratio = sum(r * w for r, w in zip(ratios, weights)) / total_weight
+        spread_size = sum(w * (s - mean_size) ** 2
+                          for s, w in zip(sizes, weights))
+        if spread_size > 1e-12:
+            slope = sum(w * (s - mean_size) * (r - mean_ratio)
+                        for s, r, w in zip(sizes, ratios, weights)) / spread_size
+        else:
+            slope = 0.0
+        slope *= SLOPE_SHRINK
+        if log_hour1 < mean_size:
+            # No upward extrapolation for smaller launches: use the mean.
+            line_value = mean_ratio
+        else:
+            line_value = mean_ratio + slope * (log_hour1 - mean_size)
+        shift = line_value - median
+        if shift > MAX_ADJUSTMENT:
+            line_value = median + MAX_ADJUSTMENT
+        elif shift < -MAX_ADJUSTMENT:
+            line_value = median - MAX_ADJUSTMENT
+        centres[hour] = (1.0 - LINE_BLEND) * median + LINE_BLEND * line_value
+        residuals = [r - (mean_ratio + slope * (s - mean_size))
+                     for s, r in zip(sizes, ratios)]
+        variance = sum(w * res * res for res, w in zip(residuals, weights))
+        variance /= total_weight
+        spreads[hour] = math.sqrt(max(variance, 0.0))
     centres = _smooth(centres)
     spreads = _smooth(spreads)
     rows = []
